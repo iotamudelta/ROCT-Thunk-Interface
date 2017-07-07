@@ -28,13 +28,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <dirent.h>
+#ifndef __FreeBSD__
 #include <malloc.h>
+#endif
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <sched.h>
 #include <pci/pci.h>
+#ifdef __FreeBSD__
+#include <sys/cpuset.h>
+#endif
 
 #include "libhsakmt.h"
 #include "fmm.h"
@@ -309,12 +314,20 @@ static void cpuid_count(uint32_t op, int count, uint32_t *eax, uint32_t *ebx,
 /* Lock current process to the specified processor */
 static int lock_to_processor(int processor)
 {
+#ifdef __FreeBSD__
+	cpuset_t set;
+
+	CPU_ZERO(&set);
+	CPU_SET(processor, &set);
+	return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set), &set);
+#endif
 	cpu_set_t cpuset;
 
 	memset(&cpuset, 0, sizeof(cpu_set_t));
 	CPU_SET(processor, &cpuset);
 	/* 0: this process */
 	return sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+#endif
 }
 
 /* Get count's order of 2. In other words, 2^rtn_value = count
@@ -953,7 +966,11 @@ static HSAKMT_STATUS topology_create_temp_cpu_cache_list(void **temp_cpu_ci_list
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
 	void *p_temp_cpu_ci_list;
 	int procs_online;
+#ifdef __FreeBSD__
+	cpuset_t orig_cpuset;
+#else
 	cpu_set_t orig_cpuset;
+#endif
 	int i;
 	uint32_t cpuid_op_cache;
 	uint32_t eax, ebx, ecx = 0, edx; /* cpuid registers */
@@ -989,7 +1006,11 @@ static HSAKMT_STATUS topology_create_temp_cpu_cache_list(void **temp_cpu_ci_list
 	 * so we can restore it after cpuid is done.
 	 */
 	CPU_ZERO(&orig_cpuset);
+#ifdef __FreeBSD__
+	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(orig_cpuset), &orig_cpuset) != 0) {
+#else
 	if (sched_getaffinity(0, sizeof(cpu_set_t), &orig_cpuset) != 0) {
+#endif
 		printf("Failed to get CPU affinity\n");
 		free(p_temp_cpu_ci_list);
 		ret = HSAKMT_STATUS_ERROR;
@@ -1020,7 +1041,11 @@ static HSAKMT_STATUS topology_create_temp_cpu_cache_list(void **temp_cpu_ci_list
 
 err:
 	/* restore affinity to original */
+#ifdef __FreeBSD__
+	cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(orig_cpuset), &orig_cpuset);
+#else
 	sched_setaffinity(0, sizeof(cpu_set_t), &orig_cpuset);
+#endif
 exit:
 	if (ret != HSAKMT_STATUS_SUCCESS)
 		topology_destroy_temp_cpu_cache_list(*temp_cpu_ci_list);
