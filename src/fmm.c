@@ -1175,7 +1175,11 @@ static void *fmm_allocate_host_gpu(uint32_t node_id, uint64_t MemorySizeInBytes,
 		 * fork. This avoids MMU notifiers and evictions due to user
 		 * memory mappings on fork.
 		 */
+#ifdef __FreeBSD__
+		minherit(mem, MemorySizeInBytes, INHERIT_NONE);
+#else
 		madvise(mem, MemorySizeInBytes, MADV_DONTFORK);
+#endif
 
 		/* Create userptr BO */
 		mmap_offset = (uint64_t)mem;
