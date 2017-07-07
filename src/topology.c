@@ -320,7 +320,7 @@ static int lock_to_processor(int processor)
 	CPU_ZERO(&set);
 	CPU_SET(processor, &set);
 	return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set), &set);
-#endif
+#else
 	cpu_set_t cpuset;
 
 	memset(&cpuset, 0, sizeof(cpu_set_t));
