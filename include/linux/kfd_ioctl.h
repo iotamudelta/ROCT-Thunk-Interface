@@ -23,8 +23,14 @@
 #ifndef KFD_IOCTL_H_INCLUDED
 #define KFD_IOCTL_H_INCLUDED
 
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/ioccom.h>
+#include <sys/mman.h>
+#else
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#endif
 
 #define KFD_IOCTL_MAJOR_VERSION 1
 #define KFD_IOCTL_MINOR_VERSION 2
