@@ -790,6 +790,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStartTrace(HSATraceId TraceId,
 					    void *TraceBuffer,
 					    HSAuint64 TraceBufferSizeBytes)
 {
+#ifdef __linux__
 	struct perf_trace *trace =
 			(struct perf_trace *)PORT_UINT64_TO_VPTR(TraceId);
 	uint32_t i;
@@ -822,6 +823,9 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStartTrace(HSATraceId TraceId,
 	trace->buf_size = TraceBufferSizeBytes;
 
 	return HSAKMT_STATUS_SUCCESS;
+#else
+	return HSAKMT_STATUS_ERROR;
+#endif
 }
 
 
