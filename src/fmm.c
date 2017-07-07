@@ -37,6 +37,12 @@
 
 #define NON_VALID_GPU_ID 0
 
+#ifdef __FreeBSD__
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE MAP_RESERVED0040
+#endif
+#endif
+
 #define INIT_MANAGEABLE_APERTURE(base_value, limit_value) {	\
 	.base = (void *) base_value,				\
 	.limit = (void *) limit_value,				\
