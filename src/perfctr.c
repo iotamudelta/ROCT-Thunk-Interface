@@ -458,6 +458,7 @@ static HSAKMT_STATUS query_trace(int fd, uint64_t *buf)
 HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 						      HsaCounterProperties **CounterProperties)
 {
+#ifdef __linux__
 	HSAKMT_STATUS rc = HSAKMT_STATUS_SUCCESS;
 	uint32_t gpu_id, i, block_id;
 	uint32_t counter_props_size = 0;
@@ -538,6 +539,9 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 	*CounterProperties = counter_props[NodeId];
 
 	return HSAKMT_STATUS_SUCCESS;
+#else
+	return HSAKMT_STATUS_ERROR;
+#endif
 }
 
 /* Registers a set of (HW) counters to be used for tracing/profiling */
