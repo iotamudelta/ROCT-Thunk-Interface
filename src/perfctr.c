@@ -866,6 +866,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcQueryTrace(HSATraceId TraceId)
 /* Stops tracing operation on a previously established set of performance counters */
 HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStopTrace(HSATraceId TraceId)
 {
+#ifdef __linux__
 	struct perf_trace *trace =
 			(struct perf_trace *)PORT_UINT64_TO_VPTR(TraceId);
 	uint32_t i;
@@ -887,4 +888,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStopTrace(HSATraceId TraceId)
 	trace->state = PERF_TRACE_STATE__STOPPED;
 
 	return ret;
+#else
+	return HSAKMT_STATUS_ERROR;
+#endif
 }
