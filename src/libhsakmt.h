@@ -30,6 +30,9 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <limits.h>
+#ifdef __FreeBSD__
+#include <sys/mman.h>
+#endif
 #include <pci/pci.h>
 
 extern int kfd_fd;
