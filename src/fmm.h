@@ -28,6 +28,9 @@
 
 #include "hsakmttypes.h"
 #include <stddef.h>
+#ifdef __FreeBSD__
+#include <sys/mman.h>
+#endif
 
 typedef enum {
 	FMM_FIRST_APERTURE_TYPE = 0,
