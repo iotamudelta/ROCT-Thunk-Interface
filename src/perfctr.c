@@ -26,7 +26,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __linux__
 #include <linux/perf_event.h>
+#endif
 #include <sys/syscall.h>
 #include "libhsakmt.h"
 #include "pmc_table.h"
@@ -374,6 +376,7 @@ static void close_perf_event_fd(struct perf_trace_block *block)
  */
 static HSAKMT_STATUS open_perf_event_fd(struct perf_trace_block *block)
 {
+#ifdef __linux__
 	struct perf_event_attr attr;
 	uint32_t i;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
@@ -415,6 +418,9 @@ static HSAKMT_STATUS open_perf_event_fd(struct perf_trace_block *block)
 	}
 
 	return ret;
+#else
+	return HSAKMT_STATUS_ERROR;
+#endif
 }
 
 static HSAKMT_STATUS perf_trace_ioctl(struct perf_trace_block *block,
@@ -434,6 +440,7 @@ static HSAKMT_STATUS perf_trace_ioctl(struct perf_trace_block *block,
 
 static HSAKMT_STATUS query_trace(int fd, uint64_t *buf)
 {
+#ifdef __linux__
 	struct perf_counts_values content;
 
 	if (fd < 0)
@@ -443,6 +450,9 @@ static HSAKMT_STATUS query_trace(int fd, uint64_t *buf)
 
 	*buf = content.val;
 	return HSAKMT_STATUS_SUCCESS;
+#else
+	return HSAKMT_STATUS_ERROR;
+#endif
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
