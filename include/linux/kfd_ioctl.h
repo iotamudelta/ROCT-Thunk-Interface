@@ -27,6 +27,8 @@
 #include <sys/types.h>
 #include <sys/ioccom.h>
 #include <sys/mman.h>
+typedef unsigned int __u32
+typedef unsigned long long __u64
 #else
 #include <linux/types.h>
 #include <linux/ioctl.h>
