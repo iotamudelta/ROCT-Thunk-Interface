@@ -40,11 +40,14 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetMemoryPolicy(HSAuint32 Node,
 					      void *MemoryAddressAlternate,
 					      HSAuint64 MemorySizeInBytes)
 {
-	struct kfd_ioctl_set_memory_policy_args args;
+	struct kfd_ioctl_set_memory_policy_args args = {0};
 	HSAKMT_STATUS result;
 	uint32_t gpu_id;
 
 	CHECK_KFD_OPEN();
+
+	pr_debug("[%s] node %d; default %d; alternate %d\n",
+		__func__, Node, DefaultPolicy, AlternatePolicy);
 
 	if (is_dgpu)
 		/* This is a legacy API useful on Kaveri only. On dGPU
@@ -70,8 +73,6 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetMemoryPolicy(HSAuint32 Node,
 
 	CHECK_PAGE_MULTIPLE(MemoryAddressAlternate);
 	CHECK_PAGE_MULTIPLE(MemorySizeInBytes);
-
-	memset(&args, 0, sizeof(args));
 
 	args.gpu_id = gpu_id;
 	args.default_policy = (DefaultPolicy == HSA_CACHING_CACHED) ?
@@ -114,9 +115,13 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtAllocMemory(HSAuint32 PreferredNode,
 
 	CHECK_KFD_OPEN();
 
+	pr_debug("[%s] node %d\n", __func__, PreferredNode);
+
 	result = validate_nodeid(PreferredNode, &gpu_id);
-	if (result != HSAKMT_STATUS_SUCCESS)
+	if (result != HSAKMT_STATUS_SUCCESS) {
+		pr_err("[%s] invalid node ID: %d\n", __func__, PreferredNode);
 		return result;
+	}
 
 	page_size = PageSizeFromFlags(MemFlags.ui32.PageSize);
 
@@ -127,8 +132,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtAllocMemory(HSAuint32 PreferredNode,
 		*MemoryAddress = fmm_allocate_host(PreferredNode, SizeInBytes,
 						MemFlags);
 
-		if (!(*MemoryAddress))
+		if (!(*MemoryAddress)) {
+			pr_err("[%s] failed to allocate %lu bytes from host\n",
+				__func__, SizeInBytes);
 			return HSAKMT_STATUS_ERROR;
+		}
 
 		return HSAKMT_STATUS_SUCCESS;
 	}
@@ -136,16 +144,22 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtAllocMemory(HSAuint32 PreferredNode,
 	if (gpu_id && MemFlags.ui32.NonPaged && !MemFlags.ui32.Scratch) {
 		*MemoryAddress = fmm_allocate_device(gpu_id, SizeInBytes, MemFlags);
 
-		if (!(*MemoryAddress))
+		if (!(*MemoryAddress)) {
+			pr_err("[%s] failed to allocate %lu bytes from device\n",
+				__func__, SizeInBytes);
 			return HSAKMT_STATUS_NO_MEMORY;
+		}
 
 		return HSAKMT_STATUS_SUCCESS;
 	}
 	if (MemFlags.ui32.Scratch) {
 		*MemoryAddress = fmm_allocate_scratch(gpu_id, SizeInBytes);
 
-		if (!(*MemoryAddress))
+		if (!(*MemoryAddress)) {
+			pr_err("[%s] failed to allocate %lu bytes from scratch\n",
+				__func__, SizeInBytes);
 			return HSAKMT_STATUS_NO_MEMORY;
+		}
 
 		return HSAKMT_STATUS_SUCCESS;
 	}
@@ -157,8 +171,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtAllocMemory(HSAuint32 PreferredNode,
 		*MemoryAddress = fmm_allocate_host(PreferredNode, SizeInBytes,
 						MemFlags);
 
-		if (!(*MemoryAddress))
+		if (!(*MemoryAddress)) {
+			pr_err("[%s] failed to allocate %lu bytes from paged\n",
+				__func__, SizeInBytes);
 			return HSAKMT_STATUS_ERROR;
+		}
 
 		return HSAKMT_STATUS_SUCCESS;
 	}
@@ -171,8 +188,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtFreeMemory(void *MemoryAddress,
 {
 	CHECK_KFD_OPEN();
 
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
+
 	if (!MemoryAddress) {
-		fprintf(stderr, "FIXME: freeing NULL pointer\n");
+		pr_err("FIXME: freeing NULL pointer\n");
 		return HSAKMT_STATUS_ERROR;
 	}
 
@@ -184,6 +203,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterMemory(void *MemoryAddress,
 					     HSAuint64 MemorySizeInBytes)
 {
 	CHECK_KFD_OPEN();
+
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
 
 	if (!is_dgpu)
 		/* TODO: support mixed APU and dGPU configurations */
@@ -201,6 +222,9 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterMemoryToNodes(void *MemoryAddress,
 	CHECK_KFD_OPEN();
 	uint32_t *gpu_id_array;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
+
+	pr_debug("[%s] address %p number of nodes %lu\n",
+		__func__, MemoryAddress, NumberOfNodes);
 
 	if (!is_dgpu)
 		/* TODO: support mixed APU and dGPU configurations */
@@ -229,6 +253,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterGraphicsHandleToNodes(HSAuint64 GraphicsRe
 	uint32_t *gpu_id_array;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
 
+	pr_debug("[%s] number of nodes %lu\n", __func__, NumberOfNodes);
+
 	ret = validate_nodeid_array(&gpu_id_array,
 			NumberOfNodes, NodeArray);
 
@@ -249,6 +275,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtShareMemory(void *MemoryAddress,
 {
 	CHECK_KFD_OPEN();
 
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
+
 	if (!SharedMemoryHandle)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 
@@ -260,6 +288,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterSharedHandle(const HsaSharedMemoryHandle *
 						   HSAuint64 *SizeInBytes)
 {
 	CHECK_KFD_OPEN();
+
+	pr_debug("[%s] handle %p\n", __func__, SharedMemoryHandle);
 
 	return hsaKmtRegisterSharedHandleToNodes(SharedMemoryHandle,
 						 MemoryAddress,
@@ -278,6 +308,9 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterSharedHandleToNodes(const HsaSharedMemoryH
 
 	uint32_t *gpu_id_array = NULL;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
+
+	pr_debug("[%s] handle %p number of nodes %lu\n",
+		__func__, SharedMemoryHandle, NumberOfNodes);
 
 	if (!SharedMemoryHandle)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
@@ -308,7 +341,7 @@ static uint64_t convertHsaToKfdRange(HsaMemoryRange *HsaRange)
 {
 	if (sizeof(struct kfd_memory_range) !=
 		sizeof(HsaMemoryRange)) {
-		fprintf(stderr, "Struct size mismatch in thunk. Cannot cast Hsa Range to KFD IOCTL range\n");
+		pr_err("Struct size mismatch in thunk. Cannot cast Hsa Range to KFD IOCTL range\n");
 		return 0;
 	}
 	return (uint64_t) HsaRange;
@@ -321,7 +354,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtProcessVMRead(HSAuint32 Pid,
 					    HSAuint64 RemoteMemoryArrayCount,
 					    HSAuint64 *SizeCopied)
 {
-	struct kfd_ioctl_cross_memory_copy_args args;
+	int ret = HSAKMT_STATUS_SUCCESS;
+	struct kfd_ioctl_cross_memory_copy_args args = {0};
+
+	pr_debug("[%s]\n", __func__);
 
 	if (!LocalMemoryArray || !RemoteMemoryArray ||
 		LocalMemoryArrayCount == 0 || RemoteMemoryArrayCount == 0)
@@ -336,15 +372,13 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtProcessVMRead(HSAuint32 Pid,
 	args.dst_mem_array_size = LocalMemoryArrayCount;
 	args.bytes_copied = 0;
 
-	int err = kmtIoctl(kfd_fd, AMDKFD_IOC_CROSS_MEMORY_COPY, &args);
-
-	if (err)
-		return HSAKMT_STATUS_ERROR;
+	if (kmtIoctl(kfd_fd, AMDKFD_IOC_CROSS_MEMORY_COPY, &args))
+		ret = HSAKMT_STATUS_ERROR;
 
 	if (SizeCopied)
 		*SizeCopied = args.bytes_copied;
 
-	return HSAKMT_STATUS_SUCCESS;
+	return ret;
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtProcessVMWrite(HSAuint32 Pid,
@@ -354,7 +388,13 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtProcessVMWrite(HSAuint32 Pid,
 					     HSAuint64 RemoteMemoryArrayCount,
 					     HSAuint64 *SizeCopied)
 {
-	struct kfd_ioctl_cross_memory_copy_args args;
+	int ret = HSAKMT_STATUS_SUCCESS;
+	struct kfd_ioctl_cross_memory_copy_args args = {0};
+
+	pr_debug("[%s]\n", __func__);
+
+	if (SizeCopied)
+		*SizeCopied = 0;
 
 	if (!LocalMemoryArray || !RemoteMemoryArray ||
 		LocalMemoryArrayCount == 0 || RemoteMemoryArrayCount == 0)
@@ -369,21 +409,21 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtProcessVMWrite(HSAuint32 Pid,
 	args.dst_mem_array_size = RemoteMemoryArrayCount;
 	args.bytes_copied = 0;
 
-	int err = kmtIoctl(kfd_fd, AMDKFD_IOC_CROSS_MEMORY_COPY, &args);
-
-	if (err)
-		return HSAKMT_STATUS_ERROR;
+	if (kmtIoctl(kfd_fd, AMDKFD_IOC_CROSS_MEMORY_COPY, &args))
+		ret = HSAKMT_STATUS_ERROR;
 
 	if (SizeCopied)
 		*SizeCopied = args.bytes_copied;
 
-	return HSAKMT_STATUS_SUCCESS;
+	return ret;
 }
 
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtDeregisterMemory(void *MemoryAddress)
 {
 	CHECK_KFD_OPEN();
+
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
 
 	return fmm_deregister_memory(MemoryAddress);
 }
@@ -394,8 +434,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtMapMemoryToGPU(void *MemoryAddress,
 {
 	CHECK_KFD_OPEN();
 
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
+
 	if (!MemoryAddress) {
-		fprintf(stderr, "FIXME: mapping NULL pointer\n");
+		pr_err("FIXME: mapping NULL pointer\n");
 		return HSAKMT_STATUS_ERROR;
 	}
 
@@ -418,8 +460,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtMapMemoryToGPUNodes(void *MemoryAddress,
 	uint32_t *gpu_id_array;
 	HSAKMT_STATUS ret;
 
+	pr_debug("[%s] address %p number of nodes %lu\n",
+		__func__, MemoryAddress, NumberOfNodes);
+
 	if (!MemoryAddress) {
-		fprintf(stderr, "FIXME: mapping NULL pointer\n");
+		pr_err("FIXME: mapping NULL pointer\n");
 		return HSAKMT_STATUS_ERROR;
 	}
 
@@ -433,17 +478,24 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtMapMemoryToGPUNodes(void *MemoryAddress,
 	if (ret != HSAKMT_STATUS_SUCCESS)
 		return ret;
 
-	return fmm_map_to_gpu_nodes(MemoryAddress, MemorySizeInBytes,
-			gpu_id_array, NumberOfNodes * sizeof(uint32_t), AlternateVAGPU);
+	ret = fmm_map_to_gpu_nodes(MemoryAddress, MemorySizeInBytes,
+		gpu_id_array, NumberOfNodes, AlternateVAGPU);
+
+	if (gpu_id_array)
+		free(gpu_id_array);
+
+	return ret;
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtUnmapMemoryToGPU(void *MemoryAddress)
 {
 	CHECK_KFD_OPEN();
 
+	pr_debug("[%s] address %p\n", __func__, MemoryAddress);
+
 	if (!MemoryAddress) {
 		/* Workaround for runtime bug */
-		fprintf(stderr, "FIXME: Unmapping NULL pointer\n");
+		pr_err("FIXME: Unmapping NULL pointer\n");
 		return HSAKMT_STATUS_SUCCESS;
 	}
 
@@ -460,49 +512,38 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtMapGraphicHandle(HSAuint32 NodeId,
 					       HSAuint64 GraphicResourceSize,
 					       HSAuint64 *FlatMemoryAddress)
 {
-
-	CHECK_KFD_OPEN();
-	HSAKMT_STATUS result;
-	uint32_t gpu_id;
-	void *graphic_handle;
-
-	if (GraphicResourceOffset != 0)
-		return HSAKMT_STATUS_NOT_IMPLEMENTED;
-
-	result = validate_nodeid(NodeId, &gpu_id);
-	if (result != HSAKMT_STATUS_SUCCESS)
-		return result;
-
-	graphic_handle = fmm_open_graphic_handle(gpu_id,
-						GraphicDeviceHandle,
-						GraphicResourceHandle,
-						GraphicResourceSize);
-
-	*FlatMemoryAddress = PORT_VPTR_TO_UINT64(graphic_handle);
-
-	if (*FlatMemoryAddress)
-		return HSAKMT_STATUS_SUCCESS;
-	else
-		return HSAKMT_STATUS_NO_MEMORY;
+	/* This API was only ever implemented in KFD for Kaveri and
+	 * was never upstreamed. There are no open-source users of
+	 * this interface. It has been superseded by
+	 * RegisterGraphicsHandleToNodes.
+	 */
+	return HSAKMT_STATUS_NOT_IMPLEMENTED;
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtUnmapGraphicHandle(HSAuint32 NodeId,
 						 HSAuint64 FlatMemoryAddress,
 						 HSAuint64 SizeInBytes)
 {
-
 	return hsaKmtUnmapMemoryToGPU(PORT_UINT64_TO_VPTR(FlatMemoryAddress));
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtGetTileConfig(HSAuint32 NodeId, HsaGpuTileConfig *config)
 {
-	struct kfd_ioctl_get_tile_config_args args;
+	struct kfd_ioctl_get_tile_config_args args = {0};
 	uint32_t gpu_id;
 	HSAKMT_STATUS result;
+
+	pr_debug("[%s] node %d\n", __func__, NodeId);
 
 	result = validate_nodeid(NodeId, &gpu_id);
 	if (result != HSAKMT_STATUS_SUCCESS)
 		return result;
+
+	/* Avoid Valgrind warnings about uninitialized data. Valgrind doesn't
+	 * know that KFD writes this.
+	 */
+	memset(config->TileConfig, 0, sizeof(*config->TileConfig) * config->NumTileConfigs);
+	memset(config->MacroTileConfig, 0, sizeof(*config->MacroTileConfig) * config->NumMacroTileConfigs);
 
 	args.gpu_id = gpu_id;
 	args.tile_config_ptr = (uint64_t)config->TileConfig;
@@ -527,6 +568,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtGetTileConfig(HSAuint32 NodeId, HsaGpuTileConfig *
 HSAKMT_STATUS HSAKMTAPI hsaKmtQueryPointerInfo(const void *Pointer,
 					       HsaPointerInfo *PointerInfo)
 {
+	pr_debug("[%s] pointer %p\n", __func__, Pointer);
+
 	if (!PointerInfo)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 	return fmm_get_mem_info(Pointer, PointerInfo);
@@ -535,5 +578,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtQueryPointerInfo(const void *Pointer,
 HSAKMT_STATUS HSAKMTAPI hsaKmtSetMemoryUserData(const void *Pointer,
 						void *UserData)
 {
+	pr_debug("[%s] pointer %p\n", __func__, Pointer);
+
 	return fmm_set_mem_user_data(Pointer, UserData);
 }

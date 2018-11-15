@@ -98,6 +98,19 @@ struct device_info vega10_device_info = {
 	.doorbell_size = DOORBELL_SIZE_GFX9,
 };
 
+struct device_info raven_device_info = {
+	.asic_family = CHIP_RAVEN,
+	.eop_buffer_size = 4096,
+	.doorbell_size = DOORBELL_SIZE_GFX9,
+};
+
+struct device_info vega20_device_info = {
+	.asic_family = CHIP_VEGA20,
+	.eop_buffer_size = 4096,
+	.doorbell_size = DOORBELL_SIZE_GFX9,
+};
+
+
 static struct device_info *dev_lookup_table[] = {
 	[CHIP_KAVERI] = &kaveri_device_info,
 	[CHIP_HAWAII] = &hawaii_device_info,
@@ -106,7 +119,9 @@ static struct device_info *dev_lookup_table[] = {
 	[CHIP_FIJI] = &fiji_device_info,
 	[CHIP_POLARIS10] = &polaris10_device_info,
 	[CHIP_POLARIS11] = &polaris11_device_info,
-	[CHIP_VEGA10] = &vega10_device_info
+	[CHIP_VEGA10] = &vega10_device_info,
+	[CHIP_VEGA20] = &vega20_device_info,
+	[CHIP_RAVEN] = &raven_device_info
 };
 
 struct device_id {
@@ -123,6 +138,12 @@ struct queue {
 	uint32_t ctx_save_restore_size;
 	uint32_t ctl_stack_size;
 	const struct device_info *dev_info;
+	/* This queue structure is allocated from GPU with page aligned size
+	 * but only small bytes are used. We use the extra space in the end for
+	 * cu_mask bits array.
+	 */
+	uint32_t cu_mask_count; /* in bits */
+	uint32_t cu_mask[0];
 };
 
 struct process_doorbells {
@@ -283,9 +304,16 @@ static HSAKMT_STATUS map_doorbell(HSAuint32 NodeId, HSAuint32 gpu_id,
 	get_doorbell_map_info(get_device_id_by_node(NodeId),
 			      &doorbells[NodeId]);
 
-	if (doorbells[NodeId].use_gpuvm)
+	if (doorbells[NodeId].use_gpuvm) {
 		status = map_doorbell_dgpu(NodeId, gpu_id, doorbell_offset);
-	else
+		if (status != HSAKMT_STATUS_SUCCESS) {
+			/* Fall back to the old method if KFD doesn't
+			 * support doorbells in GPUVM
+			 */
+			doorbells[NodeId].use_gpuvm = false;
+			status = map_doorbell_apu(NodeId, gpu_id, doorbell_offset);
+		}
+	} else
 		status = map_doorbell_apu(NodeId, gpu_id, doorbell_offset);
 
 	if (status != HSAKMT_STATUS_SUCCESS)
@@ -296,21 +324,20 @@ static HSAKMT_STATUS map_doorbell(HSAuint32 NodeId, HSAuint32 gpu_id,
 	return status;
 }
 
-static void *allocate_exec_aligned_memory_cpu(uint32_t size, uint32_t align)
+static void *allocate_exec_aligned_memory_cpu(uint32_t size)
 {
 	void *ptr;
-	int retval;
 
-	retval = posix_memalign(&ptr, align, size);
-	if (retval != 0)
-		return NULL;
+	/* mmap will return a pointer with alignment equal to
+	 * sysconf(_SC_PAGESIZE).
+	 *
+	 * MAP_ANONYMOUS initializes the memory to zero.
+	 */
+	ptr = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+				MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
-	retval = mprotect(ptr, size, PROT_READ | PROT_WRITE | PROT_EXEC);
-	if (retval != 0) {
-		free(ptr);
+	if (ptr == MAP_FAILED)
 		return NULL;
-	}
-	memset(ptr, 0, size);
 	return ptr;
 }
 
@@ -330,11 +357,7 @@ static bool update_ctx_save_restore_size(uint32_t nodeid, struct queue *q)
 		ctl_stack_size = cu_num * WAVES_PER_CU_VI * 8 + 8;
 		wg_data_size = cu_num * WG_CONTEXT_DATA_SIZE_PER_CU_VI;
 		q->ctl_stack_size = PAGE_ALIGN_UP(ctl_stack_size);
-		q->ctx_save_restore_size = PAGE_ALIGN_UP(wg_data_size);
-
-		if (q->dev_info->asic_family < CHIP_VEGA10)
-			/* GFX8 chips store ctl-stack with WG data */
-			q->ctx_save_restore_size += q->ctl_stack_size;
+		q->ctx_save_restore_size = q->ctl_stack_size + PAGE_ALIGN_UP(wg_data_size);
 
 		return true;
 	}
@@ -342,7 +365,8 @@ static bool update_ctx_save_restore_size(uint32_t nodeid, struct queue *q)
 }
 
 void *allocate_exec_aligned_memory_gpu(uint32_t size, uint32_t align,
-				       uint32_t NodeId, bool nonPaged)
+				       uint32_t NodeId, bool nonPaged,
+				       bool DeviceLocal)
 {
 	void *mem;
 	HSAuint64 gpu_va;
@@ -350,14 +374,14 @@ void *allocate_exec_aligned_memory_gpu(uint32_t size, uint32_t align,
 	HSAKMT_STATUS ret;
 
 	flags.Value = 0;
-	flags.ui32.HostAccess = 1;
+	flags.ui32.HostAccess = !DeviceLocal;
 	flags.ui32.ExecuteAccess = 1;
 	flags.ui32.NonPaged = nonPaged;
 	flags.ui32.PageSize = HSA_PAGE_SIZE_4KB;
 
 	size = ALIGN_UP(size, align);
 
-	ret = hsaKmtAllocMemory(0, size, flags, &mem);
+	ret = hsaKmtAllocMemory(DeviceLocal ? NodeId : 0, size, flags, &mem);
 	if (ret != HSAKMT_STATUS_SUCCESS)
 		return NULL;
 
@@ -386,15 +410,18 @@ void free_exec_aligned_memory_gpu(void *addr, uint32_t size, uint32_t align)
 		hsaKmtFreeMemory(addr, size);
 }
 
+/*
+ * Allocates memory aligned to sysconf(_SC_PAGESIZE)
+ */
 static void *allocate_exec_aligned_memory(uint32_t size,
-					  uint32_t align,
 					  enum asic_family_type type,
-					  uint32_t NodeId)
+					  uint32_t NodeId,
+					  bool DeviceLocal)
 {
 	if (IS_DGPU(type))
-		return allocate_exec_aligned_memory_gpu(size, align, NodeId,
-							false);
-	return allocate_exec_aligned_memory_cpu(size, align);
+		return allocate_exec_aligned_memory_gpu(size, PAGE_SIZE, NodeId,
+							DeviceLocal, DeviceLocal);
+	return allocate_exec_aligned_memory_cpu(size);
 }
 
 static void free_exec_aligned_memory(void *addr, uint32_t size, uint32_t align,
@@ -403,7 +430,7 @@ static void free_exec_aligned_memory(void *addr, uint32_t size, uint32_t align,
 	if (IS_DGPU(type))
 		free_exec_aligned_memory_gpu(addr, size, align);
 	else
-		free(addr);
+		munmap(addr, size);
 }
 
 static void free_queue(struct queue *q)
@@ -416,6 +443,7 @@ static void free_queue(struct queue *q)
 		free_exec_aligned_memory(q->ctx_save_restore,
 					 q->ctx_save_restore_size,
 					 PAGE_SIZE, q->dev_info->asic_family);
+
 	free_exec_aligned_memory((void *)q, sizeof(*q), PAGE_SIZE, q->dev_info->asic_family);
 }
 
@@ -424,34 +452,36 @@ static int handle_concrete_asic(struct queue *q,
 				uint32_t NodeId)
 {
 	const struct device_info *dev_info = q->dev_info;
+	bool ret;
 
-	if (dev_info) {
-		if (dev_info->eop_buffer_size > 0) {
-			q->eop_buffer =
-					allocate_exec_aligned_memory(q->dev_info->eop_buffer_size,
-					PAGE_SIZE,
-					dev_info->asic_family,
-					NodeId);
-			if (!q->eop_buffer)
-				return HSAKMT_STATUS_NO_MEMORY;
+	if (!dev_info || args->queue_type == KFD_IOC_QUEUE_TYPE_SDMA)
+		return HSAKMT_STATUS_SUCCESS;
 
-			args->eop_buffer_address = (uintptr_t)q->eop_buffer;
-			args->eop_buffer_size = dev_info->eop_buffer_size;
-		}
-		if (args->queue_type != KFD_IOC_QUEUE_TYPE_SDMA &&
-			update_ctx_save_restore_size(NodeId, q) == true) {
-			args->ctx_save_restore_size = q->ctx_save_restore_size;
-			args->ctl_stack_size = q->ctl_stack_size;
-			q->ctx_save_restore =
-				allocate_exec_aligned_memory(q->ctx_save_restore_size,
-							     PAGE_SIZE,
-							     dev_info->asic_family,
-							     NodeId);
-			if (!q->ctx_save_restore)
-				return HSAKMT_STATUS_NO_MEMORY;
+	if (dev_info->eop_buffer_size > 0) {
+		q->eop_buffer =
+				allocate_exec_aligned_memory(q->dev_info->eop_buffer_size,
+				dev_info->asic_family,
+				NodeId, true);
+		if (!q->eop_buffer)
+			return HSAKMT_STATUS_NO_MEMORY;
 
-			args->ctx_save_restore_address = (uintptr_t)q->ctx_save_restore;
-		}
+		args->eop_buffer_address = (uintptr_t)q->eop_buffer;
+		args->eop_buffer_size = dev_info->eop_buffer_size;
+	}
+
+	ret = update_ctx_save_restore_size(NodeId, q);
+
+	if (ret) {
+		args->ctx_save_restore_size = q->ctx_save_restore_size;
+		args->ctl_stack_size = q->ctl_stack_size;
+		q->ctx_save_restore =
+			allocate_exec_aligned_memory(q->ctx_save_restore_size,
+							 dev_info->asic_family,
+							 NodeId, false);
+		if (!q->ctx_save_restore)
+			return HSAKMT_STATUS_NO_MEMORY;
+
+		args->ctx_save_restore_address = (uintptr_t)q->ctx_save_restore;
 	}
 
 	return HSAKMT_STATUS_SUCCESS;
@@ -479,6 +509,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateQueue(HSAuint32 NodeId,
 	unsigned int doorbell_offset;
 	struct device_info *dev_info;
 	int err;
+	HsaNodeProperties props;
+	uint32_t cu_num, i;
 
 	CHECK_KFD_OPEN();
 
@@ -494,16 +526,27 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateQueue(HSAuint32 NodeId,
 	dev_info = get_device_info_by_dev_id(dev_id);
 
 	struct queue *q = allocate_exec_aligned_memory(sizeof(*q),
-			PAGE_SIZE, dev_info->asic_family,
-			NodeId);
+			dev_info->asic_family,
+			NodeId, false);
 	if (!q)
 		return HSAKMT_STATUS_NO_MEMORY;
 
 	memset(q, 0, sizeof(*q));
 
-	struct kfd_ioctl_create_queue_args args;
+	/* By default, CUs are all turned on. Initialize cu_mask to '1
+	 * for all CU bits.
+	 */
+	if (hsaKmtGetNodeProperties(NodeId, &props))
+		q->cu_mask_count = 0;
+	else {
+		cu_num = props.NumFComputeCores / props.NumSIMDPerCU;
+		/* cu_mask_count counts bits. It must be multiple of 32 */
+		q->cu_mask_count = ALIGN_UP_32(cu_num, 32);
+		for (i = 0; i < cu_num; i++)
+			q->cu_mask[i/32] |= (1 << (i % 32));
+	}
 
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_create_queue_args args = {0};
 
 	args.gpu_id = gpu_id;
 
@@ -533,7 +576,6 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateQueue(HSAuint32 NodeId,
 		free_queue(q);
 		return err;
 	}
-
 
 	args.read_pointer_address = QueueResource->QueueRptrValue;
 	args.write_pointer_address = QueueResource->QueueWptrValue;
@@ -592,7 +634,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtUpdateQueue(HSA_QUEUEID QueueId,
 					  HSAuint64 QueueSize,
 					  HsaEvent *Event)
 {
-	struct kfd_ioctl_update_queue_args arg;
+	struct kfd_ioctl_update_queue_args arg = {0};
 	struct queue *q = PORT_UINT64_TO_VPTR(QueueId);
 
 	CHECK_KFD_OPEN();
@@ -622,12 +664,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtDestroyQueue(HSA_QUEUEID QueueId)
 	CHECK_KFD_OPEN();
 
 	struct queue *q = PORT_UINT64_TO_VPTR(QueueId);
-	struct kfd_ioctl_destroy_queue_args args;
+	struct kfd_ioctl_destroy_queue_args args = {0};
 
 	if (!q)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
-
-	memset(&args, 0, sizeof(args));
 
 	args.queue_id = q->queue_id;
 
@@ -645,14 +685,13 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetQueueCUMask(HSA_QUEUEID QueueId,
 					     HSAuint32 *QueueCUMask)
 {
 	struct queue *q = PORT_UINT64_TO_VPTR(QueueId);
-	struct kfd_ioctl_set_cu_mask_args args;
+	struct kfd_ioctl_set_cu_mask_args args = {0};
 
 	CHECK_KFD_OPEN();
 
 	if (CUMaskCount == 0 || !QueueCUMask || ((CUMaskCount % 32) != 0))
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 
-	memset(&args, 0, sizeof(args));
 	args.queue_id = q->queue_id;
 	args.num_cu_mask = CUMaskCount;
 	args.cu_mask_ptr = (uintptr_t)QueueCUMask;
@@ -661,6 +700,47 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetQueueCUMask(HSA_QUEUEID QueueId,
 
 	if (err == -1)
 		return HSAKMT_STATUS_ERROR;
+
+	memcpy(q->cu_mask, QueueCUMask, CUMaskCount / 8);
+	q->cu_mask_count = CUMaskCount;
+
+	return HSAKMT_STATUS_SUCCESS;
+}
+
+HSAKMT_STATUS
+HSAKMTAPI
+hsaKmtGetQueueInfo(
+	HSA_QUEUEID QueueId,
+	HsaQueueInfo *QueueInfo
+)
+{
+	struct queue *q = PORT_UINT64_TO_VPTR(QueueId);
+	struct kfd_ioctl_get_queue_wave_state_args args = {0};
+
+	CHECK_KFD_OPEN();
+
+	if (QueueInfo == NULL || q == NULL)
+		return HSAKMT_STATUS_INVALID_PARAMETER;
+
+	if (q->ctx_save_restore == NULL)
+		return HSAKMT_STATUS_ERROR;
+
+	args.queue_id = q->queue_id;
+	args.ctl_stack_address = (uintptr_t)q->ctx_save_restore;
+
+	if (kmtIoctl(kfd_fd, AMDKFD_IOC_GET_QUEUE_WAVE_STATE, &args) < 0)
+		return HSAKMT_STATUS_ERROR;
+
+	QueueInfo->ControlStackTop = (void *)(args.ctl_stack_address +
+				q->ctl_stack_size - args.ctl_stack_used_size);
+	QueueInfo->UserContextSaveArea = (void *)
+				 (args.ctl_stack_address + q->ctl_stack_size);
+	QueueInfo->SaveAreaSizeInBytes = args.save_area_used_size;
+	QueueInfo->ControlStackUsedInBytes = args.ctl_stack_used_size;
+	QueueInfo->NumCUAssigned = q->cu_mask_count;
+	QueueInfo->CUMaskInfo = q->cu_mask;
+	QueueInfo->QueueDetailError = 0;
+	QueueInfo->QueueTypeExtended = 0;
 
 	return HSAKMT_STATUS_SUCCESS;
 }
@@ -671,7 +751,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetTrapHandler(HSAuint32 Node,
 					     void *TrapBufferBaseAddress,
 					     HSAuint64 TrapBufferSizeInBytes)
 {
-	struct kfd_ioctl_set_trap_handler_args args;
+	struct kfd_ioctl_set_trap_handler_args args = {0};
 	HSAKMT_STATUS result;
 	uint32_t gpu_id;
 
@@ -680,8 +760,6 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetTrapHandler(HSAuint32 Node,
 	result = validate_nodeid(Node, &gpu_id);
 	if (result != HSAKMT_STATUS_SUCCESS)
 		return result;
-
-	memset(&args, 0, sizeof(args));
 
 	args.gpu_id = gpu_id;
 	args.tba_addr = (uintptr_t)TrapHandlerBaseAddress;

@@ -25,6 +25,7 @@
 
 #include "libhsakmt.h"
 
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -35,10 +36,8 @@
 #include "fmm.h"
 
 static const char kfd_device_name[] = "/dev/kfd";
-static const char tmp_file[] = "/var/lock/.amd_hsa_thunk_lock";
-int amd_hsa_thunk_lock_fd;
 static pid_t parent_pid = -1;
-
+int hsakmt_debug_level;
 
 static bool is_forked_child(void)
 {
@@ -67,6 +66,10 @@ static void clear_after_fork(void)
 	clear_events_page();
 	fmm_clear_all_mem();
 	destroy_device_debugging_memory();
+	if (kfd_fd) {
+		close(kfd_fd);
+		kfd_fd = 0;
+	}
 	kfd_open_count = 0;
 }
 
@@ -76,12 +79,30 @@ static inline void init_page_size(void)
 	PAGE_SHIFT = ffs(PAGE_SIZE) - 1;
 }
 
+/* Normally libraries don't print messages. For debugging purpose, we'll
+ * print messages if an environment variable, HSAKMT_DEBUG_LEVEL, is set.
+ */
+static void init_debug_level(void)
+{
+	char *envvar;
+	int debug_level;
+
+	hsakmt_debug_level = HSAKMT_DEBUG_LEVEL_DEFAULT;
+
+	envvar = getenv("HSAKMT_DEBUG_LEVEL");
+	if (envvar) {
+		debug_level = atoi(envvar);
+		if (debug_level >= HSAKMT_DEBUG_LEVEL_ERR &&
+				debug_level <= HSAKMT_DEBUG_LEVEL_DEBUG)
+			hsakmt_debug_level = debug_level;
+	}
+}
+
 HSAKMT_STATUS HSAKMTAPI hsaKmtOpenKFD(void)
 {
 	HSAKMT_STATUS result;
 	int fd;
 	HsaSystemProperties sys_props;
-	mode_t mask;
 
 	pthread_mutex_lock(&hsakmt_mutex);
 
@@ -93,7 +114,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtOpenKFD(void)
 		clear_after_fork();
 
 	if (kfd_open_count == 0) {
-		amd_hsa_thunk_lock_fd = 0;
+		init_debug_level();
 
 		fd = open(kfd_device_name, O_RDWR | O_CLOEXEC);
 
@@ -120,24 +141,12 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtOpenKFD(void)
 			goto init_doorbell_failed;
 
 		if (init_device_debugging_memory(sys_props.NumNodes) != HSAKMT_STATUS_SUCCESS)
-			printf("Insufficient Memory. Debugging unavailable\n");
+			pr_warn("Insufficient Memory. Debugging unavailable\n");
 
-		mask = umask(0); /* save the current umask */
-		/* We don't want the existing umask to mask out S_IWOTH */
-		umask(0001);
-		amd_hsa_thunk_lock_fd = open(tmp_file,
-				O_CREAT | O_RDWR,
-				0666);
-		umask(mask); /* restore the original umask */
-		if (amd_hsa_thunk_lock_fd < 0)
-			fprintf(stderr,
-			"Profiling of privileged counters is not available\n");
-		if (init_counter_props(sys_props.NumNodes) !=
-						HSAKMT_STATUS_SUCCESS)
-			fprintf(stderr, "Profiling is not available\n");
+		init_counter_props(sys_props.NumNodes);
 	} else {
 		kfd_open_count++;
-		result = HSAKMT_STATUS_SUCCESS;
+		result = HSAKMT_STATUS_KERNEL_ALREADY_OPENED;
 	}
 
 	pthread_mutex_unlock(&hsakmt_mutex);
@@ -166,13 +175,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCloseKFD(void)
 			destroy_device_debugging_memory();
 			destroy_process_doorbells();
 			fmm_destroy_process_apertures();
-			close(kfd_fd);
-
-			if (amd_hsa_thunk_lock_fd > 0) {
-				close(amd_hsa_thunk_lock_fd);
-				unlink(tmp_file);
+			if (kfd_fd) {
+				close(kfd_fd);
+				kfd_fd = 0;
 			}
-
 		}
 
 		result = HSAKMT_STATUS_SUCCESS;

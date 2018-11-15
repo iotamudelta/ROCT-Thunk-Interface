@@ -32,7 +32,6 @@
 #include <malloc.h>
 #endif
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <sched.h>
@@ -63,6 +62,7 @@ typedef struct {
 
 static HsaSystemProperties *_system = NULL;
 static node_t *node = NULL;
+static int is_valgrind;
 
 static int processor_vendor;
 /* Supported System Vendors */
@@ -78,7 +78,6 @@ static const char *supported_processor_vendor_name[] = {
 
 static HSAKMT_STATUS topology_take_snapshot(void);
 static HSAKMT_STATUS topology_drop_snapshot(void);
-//static int get_cpu_stepping(uint16_t* stepping);
 
 static struct hsa_gfxip_table {
 	uint16_t device_id;		// Device ID
@@ -176,7 +175,21 @@ static struct hsa_gfxip_table {
 	{ 0x6867, 9, 0, 0, 1, "Vega10", CHIP_VEGA10 },
 	{ 0x6868, 9, 0, 0, 1, "Vega10", CHIP_VEGA10 },
 	{ 0x686C, 9, 0, 0, 1, "Vega10", CHIP_VEGA10 },
-	{ 0x687F, 9, 0, 0, 1, "Vega10", CHIP_VEGA10 }
+	{ 0x687F, 9, 0, 0, 1, "Vega10", CHIP_VEGA10 },
+	/* Vega12 */
+	{ 0x69A0, 9, 0, 4, 1, "Vega12", CHIP_VEGA10 },
+	{ 0x69A1, 9, 0, 4, 1, "Vega12", CHIP_VEGA10 },
+	{ 0x69A3, 9, 0, 4, 1, "Vega12", CHIP_VEGA10 },
+	{ 0x69Af, 9, 0, 4, 1, "Vega12", CHIP_VEGA10 },
+	/* Raven */
+	{ 0x15DD, 9, 0, 2, 0, "Raven", CHIP_RAVEN },
+	/* Vega20 */
+	{ 0x66A0, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
+	{ 0x66A1, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
+	{ 0x66A2, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
+	{ 0x66A3, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
+	{ 0x66A7, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
+	{ 0x66AF, 9, 0, 6, 1, "Vega20", CHIP_VEGA20 },
 };
 
 enum cache_type {
@@ -365,7 +378,8 @@ static int cpuid_find_num_cache_leaves(uint32_t op)
 	do {
 		++idx;
 		cpuid_count(op, idx, &eax.full, &ebx.full, &ecx, &edx);
-	} while (eax.split.type != CACHE_TYPE_NULL);
+		/* Modern systems have cache levels up to 3. */
+	} while (eax.split.type != CACHE_TYPE_NULL && idx < 4);
 	return idx;
 }
 
@@ -420,6 +434,12 @@ static void find_cpu_cache_siblings(cpu_cacheinfo_t *cpu_ci_list)
 	uint32_t n, j, idx_msb, apicid1, apicid2;
 	cpu_cacheinfo_t *this_cpu, *cpu2;
 	uint32_t index;
+
+	/* FixMe: cpuid under Valgrind doesn't return data from the processor we set
+	 * affinity to. We can't use that data to calculate siblings.
+	 */
+	if (is_valgrind)
+		return;
 
 	for (n = 0; n < cpu_ci_list->len; n++) {
 		this_cpu = cpu_ci_list + n;
@@ -594,6 +614,21 @@ bool topology_is_dgpu(uint16_t device_id)
 	return false;
 }
 
+bool topology_is_svm_needed(uint16_t device_id)
+{
+	const struct hsa_gfxip_table *hsa_gfxip;
+
+	if (topology_is_dgpu(device_id))
+		return true;
+
+	hsa_gfxip = find_hsa_gfxip_device(device_id);
+
+	if (hsa_gfxip && hsa_gfxip->asic_family >= CHIP_VEGA10)
+		return true;
+
+	return false;
+}
+
 static HSAKMT_STATUS topology_get_cpu_model_name(HsaNodeProperties *props,
 						 bool is_apu)
 {
@@ -607,7 +642,7 @@ static HSAKMT_STATUS topology_get_cpu_model_name(HsaNodeProperties *props,
 
 	fd = fopen(PROC_CPUINFO_PATH, "r");
 	if (!fd) {
-		printf("Failed to open [%s]. Unable to get CPU Model Name",
+		pr_err("Failed to open [%s]. Unable to get CPU Model Name",
 			PROC_CPUINFO_PATH);
 		return HSAKMT_STATUS_ERROR;
 	}
@@ -688,7 +723,7 @@ static void topology_set_processor_vendor(void)
 
 	fd = fopen(PROC_CPUINFO_PATH, "r");
 	if (!fd) {
-		printf("Failed to open [%s]. Setting Processor Vendor to %s",
+		pr_err("Failed to open [%s]. Setting Processor Vendor to %s",
 			PROC_CPUINFO_PATH, supported_processor_vendor_name[GENUINE_INTEL]);
 		processor_vendor = GENUINE_INTEL;
 		return;
@@ -708,7 +743,7 @@ static void topology_set_processor_vendor(void)
 		}
 	}
 	fclose(fd);
-	printf("Failed to get Processor Vendor. Setting to %s",
+	pr_err("Failed to get Processor Vendor. Setting to %s",
 		supported_processor_vendor_name[GENUINE_INTEL]);
 	processor_vendor = GENUINE_INTEL;
 }
@@ -719,12 +754,11 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id,
 					    struct pci_access *pacc)
 {
 	FILE *fd;
-	char *read_buf, *p;
+	char *read_buf, *p, *envvar, dummy;
 	char prop_name[256];
 	char path[256];
 	unsigned long long prop_val;
-	uint32_t i, prog;
-	uint16_t fw_version = 0;
+	uint32_t i, prog, major, minor, step;
 	int read_size;
 	const struct hsa_gfxip_table *hsa_gfxip;
 	char namebuf[HSA_PUBLIC_NAME_SIZE];
@@ -799,7 +833,7 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id,
 		else if (strcmp(prop_name, "max_slots_scratch_cu") == 0)
 			props->MaxSlotsScratchCU = (uint32_t)prop_val;
 		else if (strcmp(prop_name, "fw_version") == 0)
-			fw_version = (uint16_t)prop_val;
+			props->EngineId.Value = (uint32_t)prop_val & 0x3ff;
 		else if (strcmp(prop_name, "vendor_id") == 0)
 			props->VendorId = (uint32_t)prop_val;
 		else if (strcmp(prop_name, "device_id") == 0)
@@ -812,20 +846,33 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id,
 			props->MaxEngineClockMhzCCompute = (uint32_t)prop_val;
 		else if (strcmp(prop_name, "local_mem_size") == 0)
 			props->LocalMemSize = prop_val;
-
+		else if (strcmp(prop_name, "drm_render_minor") == 0)
+			props->DrmRenderMinor = (int32_t)prop_val;
+		else if (strcmp(prop_name, "sdma_fw_version") == 0)
+			props->uCodeEngineVersions.Value = (uint32_t)prop_val & 0x3ff;
 	}
-
-//	get_cpu_stepping(&stepping);
-	props->EngineId.ui32.uCode = fw_version & 0x3ff;
-	props->EngineId.ui32.Major = 0;
-	props->EngineId.ui32.Minor = 0;
-	props->EngineId.ui32.Stepping = 0;
 
 	hsa_gfxip = find_hsa_gfxip_device(props->DeviceId);
 	if (hsa_gfxip) {
-		props->EngineId.ui32.Major = hsa_gfxip->major & 0x3f;
-		props->EngineId.ui32.Minor = hsa_gfxip->minor;
-		props->EngineId.ui32.Stepping = hsa_gfxip->stepping;
+		envvar = getenv("HSA_OVERRIDE_GFX_VERSION");
+		if (envvar) {
+			/* HSA_OVERRIDE_GFX_VERSION=major.minor.stepping */
+			if ((sscanf(envvar, "%u.%u.%u%c",
+					&major, &minor, &step, &dummy) != 3) ||
+				(major > 63 || minor > 255 || step > 255)) {
+				pr_err("HSA_OVERRIDE_GFX_VERSION %s is invalid\n",
+					envvar);
+				ret = HSAKMT_STATUS_ERROR;
+				goto err;
+			}
+			props->EngineId.ui32.Major = major & 0x3f;
+			props->EngineId.ui32.Minor = minor & 0xff;
+			props->EngineId.ui32.Stepping = step & 0xff;
+		} else {
+			props->EngineId.ui32.Major = hsa_gfxip->major & 0x3f;
+			props->EngineId.ui32.Minor = hsa_gfxip->minor;
+			props->EngineId.ui32.Stepping = hsa_gfxip->stepping;
+		}
 
 		if (!hsa_gfxip->amd_name) {
 			ret = HSAKMT_STATUS_ERROR;
@@ -838,7 +885,7 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id,
 			/* Is APU node */
 			ret = topology_get_cpu_model_name(props, true);
 			if (ret != HSAKMT_STATUS_SUCCESS) {
-				printf("Failed to get APU Model Name from %s\n", PROC_CPUINFO_PATH);
+				pr_err("Failed to get APU Model Name from %s\n", PROC_CPUINFO_PATH);
 				ret = HSAKMT_STATUS_SUCCESS; /* No hard error, continue regardless */
 			}
 		} else {
@@ -857,7 +904,7 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id,
 		if (!props->NumFComputeCores || !props->DeviceId) {
 			ret = topology_get_cpu_model_name(props, false);
 			if (ret != HSAKMT_STATUS_SUCCESS) {
-				printf("Failed to get CPU Model Name from %s\n", PROC_CPUINFO_PATH);
+				pr_err("Failed to get CPU Model Name from %s\n", PROC_CPUINFO_PATH);
 				ret = HSAKMT_STATUS_SUCCESS; /* No hard error, continue regardless */
 			}
 		} else {
@@ -1011,7 +1058,7 @@ static HSAKMT_STATUS topology_create_temp_cpu_cache_list(void **temp_cpu_ci_list
 #else
 	if (sched_getaffinity(0, sizeof(cpu_set_t), &orig_cpuset) != 0) {
 #endif
-		printf("Failed to get CPU affinity\n");
+		pr_err("Failed to get CPU affinity\n");
 		free(p_temp_cpu_ci_list);
 		ret = HSAKMT_STATUS_ERROR;
 		goto exit;
@@ -1047,8 +1094,10 @@ err:
 	sched_setaffinity(0, sizeof(cpu_set_t), &orig_cpuset);
 #endif
 exit:
-	if (ret != HSAKMT_STATUS_SUCCESS)
+	if (ret != HSAKMT_STATUS_SUCCESS) {
+		pr_warn("Topology fails to create cpu cache list\n");
 		topology_destroy_temp_cpu_cache_list(*temp_cpu_ci_list);
+	}
 	return ret;
 }
 
@@ -1083,6 +1132,16 @@ static HSAKMT_STATUS topology_get_cpu_cache_props(node_t *tbl,
 			continue; /* this cpu doesn't belong to the node */
 		tbl->node.NumCaches +=
 			this_cpu->num_caches - this_cpu->num_duplicated_caches;
+	}
+
+	/* FixMe: cpuid under Valgrind doesn't return data from the processor we set
+	 * affinity to. All the data come from one specific processor. We'll report
+	 * this one processor's cache and ignore others.
+	 */
+	if (is_valgrind) {
+		this_cpu = cpu_ci_list;
+		tbl->node.NumCaches = this_cpu->num_caches;
+		apicid_low = apicid_max = this_cpu->apicid;
 	}
 
 	tbl->cache = calloc(
@@ -1282,19 +1341,18 @@ static HsaIoLinkProperties *topology_get_free_io_link_slot_for_node(uint32_t nod
 	HsaIoLinkProperties *props;
 
 	if (node_id >= sys_props->NumNodes) {
-		fprintf(stderr, "Invalid node [%d]\n", node_id);
+		pr_err("Invalid node [%d]\n", node_id);
 		return NULL;
 	}
 
 	props = nodes[node_id].link;
 	if (!props) {
-		fprintf(stderr, "No io_link reported for Node [%d]\n", node_id);
+		pr_err("No io_link reported for Node [%d]\n", node_id);
 		return NULL;
 	}
 
 	if (nodes[node_id].node.NumIOLinks >= sys_props->NumNodes - 1) {
-		fprintf(stderr, "No more space for io_link for Node [%d]\n",
-				node_id);
+		pr_err("No more space for io_link for Node [%d]\n", node_id);
 		return NULL;
 	}
 
@@ -1480,8 +1538,7 @@ static void topology_create_indirect_gpu_links(const HsaSystemProperties *sys_pr
 				continue;
 			if (topology_add_io_link_for_node(i, sys_props, nodes,
 				type, j, weight, true) != HSAKMT_STATUS_SUCCESS)
-				fprintf(stderr,
-					"Fail to add IO link %d->%d\n", i, j);
+				pr_err("Fail to add IO link %d->%d\n", i, j);
 		}
 	}
 }
@@ -1494,8 +1551,15 @@ HSAKMT_STATUS topology_take_snapshot(void)
 	void *cpu_ci_list = NULL;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
 	struct pci_access *pacc;
+	char *envvar;
 
 	topology_set_processor_vendor();
+	envvar = getenv("HSA_RUNNING_UNDER_VALGRIND");
+	if (envvar && !strcmp(envvar, "1"))
+		is_valgrind = 1;
+	else
+		is_valgrind = 0;
+
 retry:
 	ret = topology_sysfs_get_generation(&gen_start);
 	if (ret != HSAKMT_STATUS_SUCCESS)
@@ -1576,7 +1640,6 @@ retry:
 					}
 				}
 			}
-
 		}
 		pci_cleanup(pacc);
 	}
@@ -1621,7 +1684,7 @@ HSAKMT_STATUS topology_drop_snapshot(void)
 	HSAKMT_STATUS err;
 
 	if (!!_system != !!node) {
-		printf("Probable inconsistency?\n");
+		pr_warn("Probably inconsistency?\n");
 		err = HSAKMT_STATUS_SUCCESS;
 		goto out;
 	}

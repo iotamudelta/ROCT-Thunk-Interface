@@ -150,10 +150,10 @@ typedef struct _HsaSystemProperties
     HSAuint32    PlatformRev;      // HSA platform revision, reflects Platform Table Revision ID
 } HsaSystemProperties;
 
-typedef union 
+typedef union
 {
     HSAuint32 Value;
-    struct 
+    struct
     {
         unsigned int uCode    : 10;  // ucode packet processor version
         unsigned int Major    :  6;  // GFXIP Major engine version
@@ -161,6 +161,17 @@ typedef union
         unsigned int Stepping :  8;  // GFXIP Stepping info
     }ui32;
 } HSA_ENGINE_ID;
+
+typedef union
+{
+    HSAuint32 Value;
+    struct
+    {
+        unsigned int uCodeSDMA: 10; // ucode version SDMA engine
+        unsigned int uCodeRes : 10; // ucode version (reserved)
+        unsigned int Reserved : 12; // Reserved, must be 0
+    };
+} HSA_ENGINE_VERSION;
 
 typedef union
 {
@@ -247,11 +258,12 @@ typedef struct _HsaNodeProperties
     HSAuint64       LocalMemSize;       // Local memory size
     HSAuint32       MaxEngineClockMhzFCompute;  // maximum engine clocks for CPU and
     HSAuint32       MaxEngineClockMhzCCompute;  // GPU function, including any boost caopabilities,
-
+    HSAint32        DrmRenderMinor;             // DRM render device minor device number
     HSAuint16       MarketingName[HSA_PUBLIC_NAME_SIZE];   // Public name of the "device" on the node (board or APU name).
                                        // Unicode string
     HSAuint8        AMDName[HSA_PUBLIC_NAME_SIZE];   //CAL Name of the "device", ASCII
-    HSAuint8        Reserved[64];
+    HSA_ENGINE_VERSION uCodeEngineVersions;
+    HSAuint8        Reserved[60];
 } HsaNodeProperties;
 
 
@@ -581,6 +593,25 @@ typedef enum _HSA_QUEUE_TYPE
 
     HSA_QUEUE_TYPE_SIZE            = 0xFFFFFFFF     //aligns to 32bit enum
 } HSA_QUEUE_TYPE;
+
+typedef struct
+{
+	HSAuint32 QueueDetailError;	// HW specific queue error state
+	HSAuint32 QueueTypeExtended;	// HW specific queue type info.
+					// 0 = no information
+	HSAuint32 NumCUAssigned;	// size of *CUMaskInfo bit array, Multiple
+					// of 32, 0 = no information
+	HSAuint32* CUMaskInfo;		// runtime/system CU assignment for realtime
+					// queue & reserved CU priority. Ptr to
+					// bit-array, each bit represents one CU.
+					// NULL = no information
+	HSAuint32* UserContextSaveArea;	// reference to user space context save area
+	HSAuint64 SaveAreaSizeInBytes;	// Must be 4-Byte aligned
+	HSAuint32* ControlStackTop;	// ptr to the TOS
+	HSAuint64 ControlStackUsedInBytes; // Must be 4-Byte aligned
+	HSAuint64 Reserved1;		// runtime/system CU assignment
+	HSAuint64 Reserved2;		// runtime/system CU assignment
+} HsaQueueInfo;
 
 typedef struct _HsaQueueResource
 {
@@ -1075,8 +1106,8 @@ typedef struct _HsaPmcTraceRoot
 
 typedef struct _HsaGpuTileConfig
 {
-    const HSAuint32 *TileConfig;
-    const HSAuint32 *MacroTileConfig;
+    HSAuint32 *TileConfig;
+    HSAuint32 *MacroTileConfig;
     HSAuint32 NumTileConfigs;
     HSAuint32 NumMacroTileConfigs;
 

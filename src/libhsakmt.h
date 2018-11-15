@@ -58,13 +58,38 @@ extern int PAGE_SHIFT;
 /* VI HW bug requires this virtual address alignment */
 #define TONGA_PAGE_SIZE 0x8000
 
+/* 64KB BigK fragment size for TLB efficiency */
+#define GPU_BIGK_PAGE_SIZE (1 << 16)
+
+/* 2MB huge page size for 4-level page tables on Vega10 and later GPUs */
+#define GPU_HUGE_PAGE_SIZE (2 << 20)
+
 #define CHECK_PAGE_MULTIPLE(x) \
 	do { if ((uint64_t)PORT_VPTR_TO_UINT64(x) % PAGE_SIZE) return HSAKMT_STATUS_INVALID_PARAMETER; } while(0)
 
 #define ALIGN_UP(x,align) (((uint64_t)(x) + (align) - 1) & ~(uint64_t)((align)-1))
+#define ALIGN_UP_32(x,align) (((uint32_t)(x) + (align) - 1) & ~(uint32_t)((align)-1))
 #define PAGE_ALIGN_UP(x) ALIGN_UP(x,PAGE_SIZE)
 #define BITMASK(n) (((n) < sizeof(1ULL) * CHAR_BIT ? (1ULL << (n)) : 0) - 1ULL)
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(array[0]))
+
+/* HSA Thunk logging usage */
+extern int hsakmt_debug_level;
+#define hsakmt_print(level, fmt, ...) \
+	do { if (level <= hsakmt_debug_level) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+#define HSAKMT_DEBUG_LEVEL_DEFAULT	-1
+#define HSAKMT_DEBUG_LEVEL_ERR		3
+#define HSAKMT_DEBUG_LEVEL_WARNING	4
+#define HSAKMT_DEBUG_LEVEL_INFO		6
+#define HSAKMT_DEBUG_LEVEL_DEBUG	7
+#define pr_err(fmt, ...) \
+	hsakmt_print(HSAKMT_DEBUG_LEVEL_ERR, fmt, ##__VA_ARGS__)
+#define pr_warn(fmt, ...) \
+	hsakmt_print(HSAKMT_DEBUG_LEVEL_WARNING, fmt, ##__VA_ARGS__)
+#define pr_info(fmt, ...) \
+	hsakmt_print(HSAKMT_DEBUG_LEVEL_INFO, fmt, ##__VA_ARGS__)
+#define pr_debug(fmt, ...) \
+	hsakmt_print(HSAKMT_DEBUG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
 
 enum asic_family_type {
 	CHIP_KAVERI = 0,
@@ -74,16 +99,19 @@ enum asic_family_type {
 	CHIP_FIJI,
 	CHIP_POLARIS10,
 	CHIP_POLARIS11,
-	CHIP_VEGA10
+	CHIP_VEGA10,
+	CHIP_RAVEN,
+	CHIP_VEGA20
 };
-#define IS_DGPU(chip) (((chip) >= CHIP_TONGA && (chip) <= CHIP_VEGA10) || \
-		       (chip) == CHIP_HAWAII)
+#define IS_DGPU(chip) ((chip) != CHIP_KAVERI && (chip) != CHIP_CARRIZO && \
+		       (chip) != CHIP_RAVEN)
 #define IS_SOC15(chip) ((chip) >= CHIP_VEGA10)
 
 HSAKMT_STATUS validate_nodeid(uint32_t nodeid, uint32_t *gpu_id);
 HSAKMT_STATUS gpuid_to_nodeid(uint32_t gpu_id, uint32_t* node_id);
 uint16_t get_device_id_by_node(HSAuint32 node_id);
 uint16_t get_device_id_by_gpu_id(HSAuint32 gpu_id);
+int get_drm_render_fd_by_gpu_id(HSAuint32 gpu_id);
 HSAKMT_STATUS validate_nodeid_array(uint32_t **gpu_id_array,
 		uint32_t NumberOfNodes, uint32_t *NodeArray);
 
@@ -92,13 +120,15 @@ HSAKMT_STATUS topology_sysfs_get_node_props(uint32_t node_id, HsaNodeProperties 
 		uint32_t *gpu_id, struct pci_access* pacc);
 HSAKMT_STATUS topology_sysfs_get_system_props(HsaSystemProperties *props);
 bool topology_is_dgpu(uint16_t device_id);
+bool topology_is_svm_needed(uint16_t device_id);
 HSAKMT_STATUS topology_get_asic_family(uint16_t device_id,
 					enum asic_family_type *asic);
 
 HSAuint32 PageSizeFromFlags(unsigned int pageSizeFlags);
 
 void* allocate_exec_aligned_memory_gpu(uint32_t size, uint32_t align,
-                                       uint32_t NodeId, bool NonPaged);
+				       uint32_t NodeId, bool NonPaged,
+				       bool DeviceLocal);
 void free_exec_aligned_memory_gpu(void *addr, uint32_t size, uint32_t align);
 HSAKMT_STATUS init_process_doorbells(unsigned int NumNodes);
 void destroy_process_doorbells(void);

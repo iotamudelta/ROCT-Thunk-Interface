@@ -56,12 +56,7 @@ void *fmm_allocate_device(uint32_t gpu_id, uint64_t MemorySizeInBytes, HsaMemFla
 void *fmm_allocate_doorbell(uint32_t gpu_id, uint64_t MemorySizeInBytes, uint64_t doorbell_offset);
 void *fmm_allocate_host(uint32_t node_id, uint64_t MemorySizeInBytes,
 			HsaMemFlags flags);
-void *fmm_open_graphic_handle(uint32_t gpu_id,
-		int32_t graphic_device_handle,
-		uint32_t graphic_handle,
-		uint64_t MemorySizeInBytes);
 void fmm_print(uint32_t node);
-bool fmm_is_inside_some_aperture(void *address);
 void fmm_release(void *address);
 int fmm_map_to_gpu(void *address, uint64_t size, uint64_t *gpuvm_address);
 int fmm_unmap_from_gpu(void *address);
@@ -92,5 +87,5 @@ HSAKMT_STATUS fmm_register_shared_memory(const HsaSharedMemoryHandle *SharedMemo
 					 uint32_t *gpu_id_array,
 					 uint32_t gpu_id_array_size);
 HSAKMT_STATUS fmm_map_to_gpu_nodes(void *address, uint64_t size,
-		uint32_t *nodes_to_map, uint32_t nodes_to_map_size, uint64_t *gpuvm_address);
+		uint32_t *nodes_to_map, uint64_t num_of_nodes, uint64_t *gpuvm_address);
 #endif /* FMM_H_ */

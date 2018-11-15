@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <semaphore.h>
 
 #define BITS_PER_BYTE		CHAR_BIT
 
@@ -68,7 +71,7 @@ enum perf_trace_action {
 	PERF_TRACE_ACTION__RELEASE
 };
 
-struct perf_lockf_tbl {
+struct perf_shared_table {
 	uint32_t magic4cc;
 	uint32_t iommu_slots_left;
 };
@@ -84,10 +87,13 @@ struct perf_counts_values {
 	};
 };
 
-extern int amd_hsa_thunk_lock_fd;
-
 static HsaCounterProperties **counter_props;
 static unsigned int counter_props_count;
+static const char shmem_name[] = "/hsakmt_shared_mem";
+static int shmem_fd;
+static const char sem_name[] = "hsakmt_semaphore";
+static sem_t *sem = SEM_FAILED;
+struct perf_shared_table *shared_table;
 
 static ssize_t readn(int fd, void *buf, size_t n)
 {
@@ -110,56 +116,98 @@ static ssize_t readn(int fd, void *buf, size_t n)
 	return n;
 }
 
-static HSAKMT_STATUS init_lockf_perf_section(void)
+static HSAKMT_STATUS init_shared_region(void)
 {
-	struct perf_lockf_tbl lockf_tbl;
-	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
-
-	if (amd_hsa_thunk_lock_fd <= 0)
-		return HSAKMT_STATUS_UNAVAILABLE;
-
-	if (lockf(amd_hsa_thunk_lock_fd, F_TLOCK, sizeof(lockf_tbl)))
+	sem = sem_open(sem_name, O_CREAT, 0666, 1);
+	if (sem == SEM_FAILED)
 		return HSAKMT_STATUS_ERROR;
 
-	memset(&lockf_tbl, 0, sizeof(lockf_tbl));
-	if (readn(amd_hsa_thunk_lock_fd, &lockf_tbl, sizeof(lockf_tbl)) < 0) {
-		ret = HSAKMT_STATUS_ERROR;
-		goto out;
+	shmem_fd = shm_open(shmem_name, O_CREAT | O_RDWR, 0666);
+	if (shmem_fd < 0)
+		goto exit_1;
+
+	if (ftruncate(shmem_fd, sizeof(struct perf_shared_table)) < 0)
+		goto exit_2;
+
+	shared_table = mmap(NULL, sizeof(*shared_table),
+			PROT_READ | PROT_WRITE, MAP_SHARED, shmem_fd, 0);
+	if (shared_table == MAP_FAILED)
+		goto exit_2;
+
+	return HSAKMT_STATUS_SUCCESS;
+
+exit_2:
+	shm_unlink(shmem_name);
+	shmem_fd = 0;
+exit_1:
+	sem_close(sem);
+	sem_unlink(sem_name);
+	sem = SEM_FAILED;
+	return HSAKMT_STATUS_ERROR;
+}
+
+static void destroy_shared_region(void)
+{
+	if (shared_table && shared_table != MAP_FAILED)
+		munmap(shared_table, sizeof(*shared_table));
+
+	if (shmem_fd > 0) {
+		close(shmem_fd);
+		shm_unlink(shmem_name);
 	}
-	/* If the magic number exists, the lock file table has been
+
+	if (sem != SEM_FAILED) {
+		sem_close(sem);
+		sem_unlink(sem_name);
+		sem = SEM_FAILED;
+	}
+}
+
+static void init_perf_shared_table(void)
+{
+	sem_wait(sem);
+
+	/* If the magic number exists, the perf shared table has been
 	 * initialized by another process and is in use. Don't overwrite it.
 	 */
-	if (lockf_tbl.magic4cc == HSA_PERF_MAGIC4CC)
-		goto out;
-	/* write the perf content */
-	lockf_tbl.magic4cc = HSA_PERF_MAGIC4CC;
-	lockf_tbl.iommu_slots_left =
-		pmc_table_get_max_concurrent(PERFCOUNTER_BLOCKID__IOMMUV2);
-	if (write(amd_hsa_thunk_lock_fd, &lockf_tbl, sizeof(lockf_tbl)) < 0)
-		ret = HSAKMT_STATUS_ERROR;
-out:
-	/* unlock the perf section */
-	if (lockf(amd_hsa_thunk_lock_fd, F_ULOCK, sizeof(lockf_tbl)))
-		ret = HSAKMT_STATUS_ERROR;
+	if (shared_table->magic4cc == HSA_PERF_MAGIC4CC) {
+		sem_post(sem);
+		return;
+	}
 
-	return ret;
+	/* write the perf content */
+	shared_table->magic4cc = HSA_PERF_MAGIC4CC;
+	shared_table->iommu_slots_left =
+		pmc_table_get_max_concurrent(PERFCOUNTER_BLOCKID__IOMMUV2);
+
+	sem_post(sem);
 }
 
 HSAKMT_STATUS init_counter_props(unsigned int NumNodes)
 {
 	counter_props = calloc(NumNodes, sizeof(struct HsaCounterProperties *));
-	if (!counter_props)
+	if (!counter_props) {
+		pr_warn("Profiling is not available.\n");
 		return HSAKMT_STATUS_NO_MEMORY;
+	}
 
 	counter_props_count = NumNodes;
 	alloc_pmc_blocks();
 
-	return init_lockf_perf_section();
+	if (init_shared_region() != HSAKMT_STATUS_SUCCESS) {
+		pr_warn("Profiling of privileged blocks is not available.\n");
+		return HSAKMT_STATUS_ERROR;
+	}
+	init_perf_shared_table();
+
+	return HSAKMT_STATUS_SUCCESS;
 }
 
 void destroy_counter_props(void)
 {
 	unsigned int i;
+
+	destroy_shared_region();
 
 	if (!counter_props)
 		return;
@@ -187,6 +235,9 @@ static int blockid2uuid(enum perf_block_id block_id, HSA_UUID *uuid)
 		break;
 	case PERFCOUNTER_BLOCKID__CPG:
 		*uuid = HSA_PROFILEBLOCK_AMD_CPG;
+		break;
+	case PERFCOUNTER_BLOCKID__DB:
+		*uuid = HSA_PROFILEBLOCK_AMD_DB;
 		break;
 	case PERFCOUNTER_BLOCKID__GDS:
 		*uuid = HSA_PROFILEBLOCK_AMD_GDS;
@@ -261,11 +312,13 @@ static HSAuint32 get_block_concurrent_limit(uint32_t node_id,
 						HSAuint32 block_id)
 {
 	uint32_t i;
+	HsaCounterBlockProperties *block = &counter_props[node_id]->Blocks[0];
 
-	for (i = 0; i < PERFCOUNTER_BLOCKID__MAX; i++)
-		if (counter_props[node_id]->Blocks[i].Counters[0].BlockIndex ==
-								block_id)
-			return counter_props[node_id]->Blocks[i].NumConcurrent;
+	for (i = 0; i < PERFCOUNTER_BLOCKID__MAX; i++) {
+		if (block->Counters[0].BlockIndex == block_id)
+			return block->NumConcurrent;
+		block = (HsaCounterBlockProperties *)&block->Counters[block->NumCounters];
+	}
 
 	return 0;
 }
@@ -273,29 +326,18 @@ static HSAuint32 get_block_concurrent_limit(uint32_t node_id,
 static HSAKMT_STATUS update_block_slots(enum perf_trace_action action,
 					uint32_t block_id, uint32_t num_slots)
 {
-	struct perf_lockf_tbl lockf_tbl;
 	uint32_t *slots_left;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
 
-	if (amd_hsa_thunk_lock_fd <= 0)
+	if (shmem_fd <= 0)
+		return HSAKMT_STATUS_UNAVAILABLE;
+	if (sem == SEM_FAILED)
 		return HSAKMT_STATUS_UNAVAILABLE;
 
-	if (lockf(amd_hsa_thunk_lock_fd, F_TLOCK, sizeof(lockf_tbl)) < 0)
-		return HSAKMT_STATUS_ERROR;
-
-	if (lseek(amd_hsa_thunk_lock_fd, 0, SEEK_SET)) {
-		ret = HSAKMT_STATUS_ERROR;
-				goto out;
-	}
-
-	if (readn(amd_hsa_thunk_lock_fd, &lockf_tbl, sizeof(lockf_tbl))
-			!= sizeof(lockf_tbl)) {
-		ret = HSAKMT_STATUS_ERROR;
-		goto out;
-	}
+	sem_wait(sem);
 
 	if (block_id == PERFCOUNTER_BLOCKID__IOMMUV2)
-		slots_left = &lockf_tbl.iommu_slots_left;
+		slots_left = &shared_table->iommu_slots_left;
 	else {
 		ret = HSAKMT_STATUS_UNAVAILABLE;
 		goto out;
@@ -320,14 +362,8 @@ static HSAKMT_STATUS update_block_slots(enum perf_trace_action action,
 		break;
 	}
 
-	if (ret == HSAKMT_STATUS_SUCCESS) {
-		if (write(amd_hsa_thunk_lock_fd, &lockf_tbl, sizeof(lockf_tbl)) < 0)
-			ret = HSAKMT_STATUS_ERROR;
-	}
 out:
-	/* unlock the perf section */
-	if (lockf(amd_hsa_thunk_lock_fd, F_ULOCK, sizeof(lockf_tbl)))
-		ret = HSAKMT_STATUS_ERROR;
+	sem_post(sem);
 
 	return ret;
 }
@@ -337,9 +373,16 @@ static unsigned int get_perf_event_type(enum perf_block_id block_id)
 	FILE *file = NULL;
 	unsigned int type = 0;
 
-	if (block_id == PERFCOUNTER_BLOCKID__IOMMUV2)
-		file = fopen("/sys/bus/event_source/devices/amd_iommu/type",
+	if (block_id == PERFCOUNTER_BLOCKID__IOMMUV2) {
+		/* Starting from kernel 4.12, amd_iommu_0 is used */
+		file = fopen("/sys/bus/event_source/devices/amd_iommu_0/type",
 			 "r");
+		if (!file)
+			file = fopen(/* kernel 4.11 and older */
+				"/sys/bus/event_source/devices/amd_iommu/type",
+				"r");
+	}
+
 	if (!file)
 		return 0;
 
@@ -385,8 +428,7 @@ static HSAKMT_STATUS open_perf_event_fd(struct perf_trace_block *block)
 		return HSAKMT_STATUS_INVALID_HANDLE;
 
 	if (getuid()) {
-		fprintf(stderr,
-			"Error. Must be root to open perf_event.\n");
+		pr_err("Must be root to open perf_event.\n");
 		return HSAKMT_STATUS_ERROR;
 	}
 
@@ -466,7 +508,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 	uint32_t total_concurrent = 0;
 	struct perf_counter_block block = {0};
 	uint32_t total_blocks = 0;
-	uint32_t entry;
+	HsaCounterBlockProperties *block_prop;
 
 	if (!counter_props)
 		return HSAKMT_STATUS_NO_MEMORY;
@@ -474,7 +516,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 	if (!CounterProperties)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 
-	if (validate_nodeid(NodeId, &gpu_id) != 0)
+	if (validate_nodeid(NodeId, &gpu_id) != HSAKMT_STATUS_SUCCESS)
 		return HSAKMT_STATUS_INVALID_NODE_UNIT;
 
 	if (counter_props[NodeId]) {
@@ -494,8 +536,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 	}
 
 	counter_props_size = sizeof(HsaCounterProperties) +
-			sizeof(HsaCounterBlockProperties)*(total_blocks-1) +
-			sizeof(HsaCounter)*(total_counters-1);
+			sizeof(HsaCounterBlockProperties) * (total_blocks - 1) +
+			sizeof(HsaCounter) * (total_counters - total_blocks);
 
 	counter_props[NodeId] = malloc(counter_props_size);
 	if (!counter_props[NodeId])
@@ -504,36 +546,34 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcGetCounterProperties(HSAuint32 NodeId,
 	counter_props[NodeId]->NumBlocks = total_blocks;
 	counter_props[NodeId]->NumConcurrent = total_concurrent;
 
-	entry = 0;
+	block_prop = &counter_props[NodeId]->Blocks[0];
 	for (block_id = 0; block_id < PERFCOUNTER_BLOCKID__MAX; block_id++) {
 		rc = get_block_properties(NodeId, block_id, &block);
 		if (rc != HSAKMT_STATUS_SUCCESS) {
 			free(counter_props[NodeId]);
+			counter_props[NodeId] = NULL;
 			return rc;
 		}
 
 		if (!block.num_of_slots) /* not a valid block */
 			continue;
 
-		blockid2uuid(block_id,
-			&counter_props[NodeId]->Blocks[entry].BlockId);
-		counter_props[NodeId]->Blocks[entry].NumCounters =
-					block.num_of_counters;
-		counter_props[NodeId]->Blocks[entry].NumConcurrent =
-					block.num_of_slots;
-
+		blockid2uuid(block_id, &block_prop->BlockId);
+		block_prop->NumCounters = block.num_of_counters;
+		block_prop->NumConcurrent = block.num_of_slots;
 		for (i = 0; i < block.num_of_counters; i++) {
-			counter_props[NodeId]->Blocks[entry].Counters[i].BlockIndex = block_id;
-			counter_props[NodeId]->Blocks[entry].Counters[i].CounterId = block.counter_ids[i];
-			counter_props[NodeId]->Blocks[entry].Counters[i].CounterSizeInBits = block.counter_size_in_bits;
-			counter_props[NodeId]->Blocks[entry].Counters[i].CounterMask = block.counter_mask;
-			counter_props[NodeId]->Blocks[entry].Counters[i].Flags.ui32.Global = 1;
+			block_prop->Counters[i].BlockIndex = block_id;
+			block_prop->Counters[i].CounterId = block.counter_ids[i];
+			block_prop->Counters[i].CounterSizeInBits = block.counter_size_in_bits;
+			block_prop->Counters[i].CounterMask = block.counter_mask;
+			block_prop->Counters[i].Flags.ui32.Global = 1;
 			if (block_id == PERFCOUNTER_BLOCKID__IOMMUV2)
-				counter_props[NodeId]->Blocks[entry].Counters[i].Type = HSA_PROFILE_TYPE_PRIVILEGED_IMMEDIATE;
+				block_prop->Counters[i].Type = HSA_PROFILE_TYPE_PRIVILEGED_IMMEDIATE;
 			else
-				counter_props[NodeId]->Blocks[entry].Counters[i].Type = HSA_PROFILE_TYPE_NONPRIV_IMMEDIATE;
+				block_prop->Counters[i].Type = HSA_PROFILE_TYPE_NONPRIV_IMMEDIATE;
 		}
-		entry++;
+
+		block_prop = (HsaCounterBlockProperties *)&block_prop->Counters[block_prop->NumCounters];
 	}
 
 	*CounterProperties = counter_props[NodeId];
@@ -561,6 +601,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcRegisterTrace(HSAuint32 NodeId,
 	uint64_t *counter_id_ptr;
 	int *fd_ptr;
 
+	pr_debug("[%s] Number of counters %d\n", __func__, NumberOfCounters);
+
 	if (!counter_props)
 		return HSAKMT_STATUS_NO_MEMORY;
 
@@ -571,7 +613,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcRegisterTrace(HSAuint32 NodeId,
 		return HSAKMT_STATUS_INVALID_NODE_UNIT;
 
 	if (NumberOfCounters > MAX_COUNTERS) {
-		fprintf(stderr, "Error: MAX_COUNTERS is too small for %d.\n",
+		pr_err("MAX_COUNTERS is too small for %d.\n",
 			NumberOfCounters);
 		return HSAKMT_STATUS_NO_MEMORY;
 	}
@@ -599,11 +641,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcRegisterTrace(HSAuint32 NodeId,
 			continue;
 		concurrent_limit = get_block_concurrent_limit(NodeId, i);
 		if (!concurrent_limit) {
-			fprintf(stderr, "Invalid block ID: %d\n", i);
+			pr_err("Invalid block ID: %d\n", i);
 			return HSAKMT_STATUS_INVALID_PARAMETER;
 		}
 		if (num_counters[i] > concurrent_limit) {
-			fprintf(stderr, "Counters exceed the limit.\n");
+			pr_err("Counters exceed the limit.\n");
 			return HSAKMT_STATUS_INVALID_PARAMETER;
 		}
 		num_blocks++;
@@ -688,10 +730,12 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcUnregisterTrace(HSAuint32 NodeId,
 	uint32_t gpu_id;
 	struct perf_trace *trace;
 
+	pr_debug("[%s] Trace ID 0x%lx\n", __func__, TraceId);
+
 	if (TraceId == 0)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 
-	if (validate_nodeid(NodeId, &gpu_id) != 0)
+	if (validate_nodeid(NodeId, &gpu_id) != HSAKMT_STATUS_SUCCESS)
 		return HSAKMT_STATUS_INVALID_NODE_UNIT;
 
 	trace = (struct perf_trace *)PORT_UINT64_TO_VPTR(TraceId);
@@ -722,6 +766,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcAcquireTraceAccess(HSAuint32 NodeId,
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
 	uint32_t gpu_id, i;
 	int j;
+
+	pr_debug("[%s] Trace ID 0x%lx\n", __func__, TraceId);
 
 	if (TraceId == 0)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
@@ -766,6 +812,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcReleaseTraceAccess(HSAuint32 NodeId,
 	struct perf_trace *trace;
 	uint32_t i;
 
+	pr_debug("[%s] Trace ID 0x%lx\n", __func__, TraceId);
+
 	if (TraceId == 0)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
 
@@ -796,6 +844,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStartTrace(HSATraceId TraceId,
 	uint32_t i;
 	int32_t j;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
+
+	pr_debug("[%s] Trace ID 0x%lx\n", __func__, TraceId);
 
 	if (TraceId == 0 || !TraceBuffer || TraceBufferSizeBytes == 0)
 		return HSAKMT_STATUS_INVALID_PARAMETER;
@@ -847,6 +897,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcQueryTrace(HSATraceId TraceId)
 		return HSAKMT_STATUS_INVALID_HANDLE;
 
 	buf = (uint64_t *)trace->buf;
+	pr_debug("[%s] Trace buffer(%p): ", __func__, buf);
 	for (i = 0; i < trace->num_blocks; i++)
 		for (j = 0; j < trace->blocks[i].num_counters; j++) {
 			buf_filled += sizeof(uint64_t);
@@ -856,8 +907,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcQueryTrace(HSATraceId TraceId)
 					buf);
 			if (ret != HSAKMT_STATUS_SUCCESS)
 				return ret;
+			pr_debug("%lu_", *buf);
 			buf++;
 		}
+	pr_debug("\n");
 
 	return HSAKMT_STATUS_SUCCESS;
 }
@@ -871,6 +924,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtPmcStopTrace(HSATraceId TraceId)
 			(struct perf_trace *)PORT_UINT64_TO_VPTR(TraceId);
 	uint32_t i;
 	HSAKMT_STATUS ret = HSAKMT_STATUS_SUCCESS;
+
+	pr_debug("[%s] Trace ID 0x%lx\n", __func__, TraceId);
 
 	if (TraceId == 0)
 		return HSAKMT_STATUS_INVALID_PARAMETER;

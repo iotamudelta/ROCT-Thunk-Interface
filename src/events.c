@@ -51,6 +51,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 					  bool ManualReset, bool IsSignaled,
 					  HsaEvent **Event)
 {
+	unsigned int event_limit = KFD_SIGNAL_EVENT_LIMIT;
+
 	CHECK_KFD_OPEN();
 
 	if (EventDesc->EventType >= HSA_EVENTTYPE_MAXID)
@@ -63,9 +65,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 
 	memset(e, 0, sizeof(*e));
 
-	struct kfd_ioctl_create_event_args args;
-
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_create_event_args args = {0};
 
 	args.event_type = EventDesc->EventType;
 	args.node_id = EventDesc->NodeId;
@@ -76,12 +76,12 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 
 	if (is_dgpu && !events_page) {
 		events_page = allocate_exec_aligned_memory_gpu(
-			KFD_SIGNAL_EVENT_LIMIT * 8, PAGE_SIZE, 0, true);
+			KFD_SIGNAL_EVENT_LIMIT * 8, PAGE_SIZE, 0, true, false);
 		if (!events_page) {
 			pthread_mutex_unlock(&hsakmt_mutex);
 			return HSAKMT_STATUS_ERROR;
 		}
-		fmm_get_handle(events_page, &args.event_page_offset);
+		fmm_get_handle(events_page, (uint64_t *)&args.event_page_offset);
 	}
 
 	if (kmtIoctl(kfd_fd, AMDKFD_IOC_CREATE_EVENT, &args) != 0) {
@@ -94,8 +94,14 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 	e->EventId = args.event_id;
 
 	if (!events_page && args.event_page_offset > 0) {
-		events_page = mmap(NULL, KFD_SIGNAL_EVENT_LIMIT * 8, PROT_WRITE | PROT_READ,
+		events_page = mmap(NULL, event_limit * 8, PROT_WRITE | PROT_READ,
 				MAP_SHARED, kfd_fd, args.event_page_offset);
+		if (events_page == MAP_FAILED) {
+			/* old kernels only support 256 events */
+			event_limit = 256;
+			events_page = mmap(NULL, PAGE_SIZE, PROT_WRITE | PROT_READ,
+					   MAP_SHARED, kfd_fd, args.event_page_offset);
+		}
 		if (events_page == MAP_FAILED) {
 			events_page = NULL;
 			pthread_mutex_unlock(&hsakmt_mutex);
@@ -106,7 +112,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 
 	pthread_mutex_unlock(&hsakmt_mutex);
 
-	if (args.event_page_offset > 0 && args.event_slot_index < KFD_SIGNAL_EVENT_LIMIT)
+	if (args.event_page_offset > 0 && args.event_slot_index < event_limit)
 		e->EventData.HWData2 = (HSAuint64)&events_page[args.event_slot_index];
 
 	e->EventData.EventType = EventDesc->EventType;
@@ -119,9 +125,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
 		EventDesc->SyncVar.SyncVarSize;
 
 	if (IsSignaled && !IsSystemEventType(e->EventData.EventType)) {
-		struct kfd_ioctl_set_event_args set_args;
+		struct kfd_ioctl_set_event_args set_args = {0};
 
-		memset(&set_args, 0, sizeof(set_args));
 		set_args.event_id = args.event_id;
 
 		kmtIoctl(kfd_fd, AMDKFD_IOC_SET_EVENT, &set_args);
@@ -139,9 +144,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtDestroyEvent(HsaEvent *Event)
 	if (!Event)
 		return HSAKMT_STATUS_INVALID_HANDLE;
 
-	struct kfd_ioctl_destroy_event_args args;
-
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_destroy_event_args args = {0};
 
 	args.event_id = Event->EventId;
 
@@ -165,9 +168,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetEvent(HsaEvent *Event)
 	if (IsSystemEventType(Event->EventData.EventType))
 		return HSAKMT_STATUS_ERROR;
 
-	struct kfd_ioctl_set_event_args args;
-
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_set_event_args args = {0};
 
 	args.event_id = Event->EventId;
 
@@ -190,9 +191,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtResetEvent(HsaEvent *Event)
 	if (IsSystemEventType(Event->EventData.EventType))
 		return HSAKMT_STATUS_ERROR;
 
-	struct kfd_ioctl_reset_event_args args;
-
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_reset_event_args args = {0};
 
 	args.event_id = Event->EventId;
 
@@ -221,6 +220,66 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnEvent(HsaEvent *Event,
 	return hsaKmtWaitOnMultipleEvents(&Event, 1, true, Milliseconds);
 }
 
+//Analysis memory exception data, print debug messages
+static void analysis_memory_exception(struct kfd_hsa_memory_exception_data *
+						memory_exception_data)
+{
+	HSAKMT_STATUS ret;
+	HsaPointerInfo info;
+	const uint64_t addr = memory_exception_data->va;
+	uint32_t node_id = 0;
+	unsigned int i;
+
+	gpuid_to_nodeid(memory_exception_data->gpu_id, &node_id);
+	pr_err("Memory exception on virtual address 0x%lx, ", addr);
+	pr_err("node id %d : ", node_id);
+	if (memory_exception_data->failure.NotPresent)
+		pr_err("Page not present\n");
+	else if (memory_exception_data->failure.ReadOnly)
+		pr_err("Writing to readonly page\n");
+	else if (memory_exception_data->failure.NoExecute)
+		pr_err("Execute to none-executable page\n");
+
+	ret = fmm_get_mem_info((const void *)addr, &info);
+
+	if (ret != HSAKMT_STATUS_SUCCESS) {
+		pr_err("Address does not belong to a known buffer\n");
+		return;
+	}
+
+	pr_err("GPU address 0x%lx, node id %d, size in byte 0x%lx\n",
+			info.GPUAddress, info.Node, info.SizeInBytes);
+	switch (info.Type) {
+	case HSA_POINTER_REGISTERED_GRAPHICS:
+		pr_err("Memory is registered graphics buffer\n");
+		break;
+	case HSA_POINTER_REGISTERED_USER:
+		pr_err("Memory is registered user pointer\n");
+		pr_err("CPU address of the memory is %p\n", info.CPUAddress);
+		break;
+	case HSA_POINTER_ALLOCATED:
+		pr_err("Memory is allocated using hsaKmtAllocMemory\n");
+		pr_err("CPU address of the memory is %p\n", info.CPUAddress);
+		break;
+	default:
+		pr_err("Invalid memory type %d\n", info.Type);
+		break;
+	}
+
+	if (info.RegisteredNodes) {
+		pr_err("Memory is registered to node id: ");
+		for (i = 0; i < info.NRegisteredNodes; i++)
+			pr_err("%d ", info.RegisteredNodes[i]);
+		pr_err("\n");
+	}
+	if (info.MappedNodes) {
+		pr_err("Memory is mapped to node id: ");
+		for (i = 0; i < info.NMappedNodes; i++)
+			pr_err("%d ", info.MappedNodes[i]);
+		pr_err("\n");
+	}
+}
+
 HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnMultipleEvents(HsaEvent *Events[],
 						   HSAuint32 NumEvents,
 						   bool WaitOnAll,
@@ -238,9 +297,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnMultipleEvents(HsaEvent *Events[],
 		event_data[i].kfd_event_data_ext = (uint64_t)(uintptr_t)NULL;
 	}
 
-	struct kfd_ioctl_wait_events_args args;
-
-	memset(&args, 0, sizeof(args));
+	struct kfd_ioctl_wait_events_args args = {0};
 
 	args.wait_for_all = WaitOnAll;
 	args.timeout = Milliseconds;
@@ -266,6 +323,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnMultipleEvents(HsaEvent *Events[],
 				Events[i]->EventData.EventData.MemoryAccessFault.Failure.NoExecute = event_data[i].memory_exception_data.failure.NoExecute;
 				Events[i]->EventData.EventData.MemoryAccessFault.Failure.Imprecise = event_data[i].memory_exception_data.failure.imprecise;
 				Events[i]->EventData.EventData.MemoryAccessFault.Flags = HSA_EVENTID_MEMORY_FATAL_PROCESS;
+				analysis_memory_exception(&event_data[i].memory_exception_data);
 			}
 		}
 	}

@@ -1601,8 +1601,8 @@ static HSAKMT_STATUS alloc_pmc_blocks_iommu(void)
 {
 	DIR *dir;
 	struct dirent *dent;
-	const char sysfs_amdiommu_event_path[] =
-			"/sys/bus/event_source/devices/amd_iommu/events";
+	const char *sysfs_amdiommu_event_path =
+			"/sys/bus/event_source/devices/amd_iommu_0/events";
 	/* Counter source in IOMMU's Counter Bank Addressing register is 8 bits,
 	 * so the biggest counter number/id possible is 0xff.
 	 */
@@ -1619,8 +1619,14 @@ static HSAKMT_STATUS alloc_pmc_blocks_iommu(void)
 	memset(block, 0, sizeof(struct perf_counter_block));
 
 	dir = opendir(sysfs_amdiommu_event_path);
-	if (!dir)
-		goto out;
+	if (!dir) {
+		/* Before kernel 4.12, amd_iommu is the path */
+		sysfs_amdiommu_event_path =
+			"/sys/bus/event_source/devices/amd_iommu/events";
+		dir = opendir(sysfs_amdiommu_event_path);
+		if (!dir)
+			goto out;
+	}
 
 	memset(counter_id, 0, max_counter_id + 1);
 	while ((dent = readdir(dir))) {
@@ -1628,7 +1634,7 @@ static HSAKMT_STATUS alloc_pmc_blocks_iommu(void)
 			continue;
 		if (snprintf(path, len, "%s/%s", sysfs_amdiommu_event_path,
 						dent->d_name) >= len) {
-			fprintf(stderr, "Increase path length.\n");
+			pr_err("Increase path length.\n");
 			ret = HSAKMT_STATUS_NO_MEMORY;
 			goto out;
 		}
@@ -1644,8 +1650,7 @@ static HSAKMT_STATUS alloc_pmc_blocks_iommu(void)
 		}
 		if (num > max_counter_id)
 		/* This should never happen. If it does, check IOMMU driver. */
-			fprintf(stderr,
-				"Error: max_counter_id %d is set too small.\n",
+			pr_err("max_counter_id %d is set too small.\n",
 				max_counter_id);
 		else {
 			counter_id[num] = 1;
@@ -1671,7 +1676,7 @@ static HSAKMT_STATUS alloc_pmc_blocks_iommu(void)
 		"/sys/devices/virtual/kfd/kfd/topology/nodes",
 		0, /* IOMMU is in node 0. Change this if NUMA is introduced to APU. */
 		"perf/iommu/max_concurrent") >= len) {
-		fprintf(stderr, "Increase path length\n");
+		pr_err("Increase path length\n");
 		ret = HSAKMT_STATUS_NO_MEMORY;
 		goto out;
 	};
@@ -1740,6 +1745,8 @@ HSAKMT_STATUS get_block_properties(uint32_t node_id,
 		*block = polaris_blocks[block_id];
 		break;
 	case CHIP_VEGA10:
+	case CHIP_VEGA20:
+	case CHIP_RAVEN:
 		*block = vega_blocks[block_id];
 		break;
 	default:
